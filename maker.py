@@ -7,7 +7,6 @@ Rage Expression Maker
 @time: 2017/3/10
 """
 
-
 import numpy as np
 from matplotlib import pyplot as plt
 import cv2
@@ -21,6 +20,31 @@ class Template:
         self.iy = 0
         self.iw = 0
         self.ih = 0
+
+class Face:
+    def __init__(self, img, eye_top, eye_bottom):
+        self.img = img
+        self.eye_top = eye_top
+        self.eye_bottom = eye_bottom
+
+
+def conv(conv_m, img):
+    conv_m = np.array(conv_m)
+    new_img = np.zeros_like(img, dtype=np.uint8)
+    new_img += 255
+    y_bound, x_bound, _ = img.shape
+    half = len(conv_m) / 2
+    rhalf = len(conv_m) - half
+    for y in range(img.shape[0] - len(conv_m) + 1):
+        for x in range(img.shape[1] - len(conv_m) + 1):
+            if y < half or y + rhalf > y_bound or x < half or x + rhalf > x_bound:
+                continue
+            cut = img[max(0, y - half):min(y_bound, y + rhalf), max(0, x - half):min(x_bound, x + rhalf)]
+            cut = cut[:, :, 0]
+            value = (cut / 2 * conv_m).sum()
+            value += 128
+            new_img[y, x] = value
+    return new_img
 
 
 class ExpressionMaker:
@@ -42,9 +66,16 @@ class ExpressionMaker:
         expressions = []
         print('Recognize %d faces in img %s' % (len(faces), img_name))
         for i, face in enumerate(faces):
+            # print log
             block = int(float(20 * (i + 1)) / len(faces) + 0.5)
-            print '\r' + '■'*block + '□'*(20 - block) + '%d / %d' % (i+1, len(faces)),
+            print '\r' + '■' * block + '□' * (20 - block) + '%d / %d' % (i + 1, len(faces)),
+            # set image to gray mode
+            gray = cv2.cvtColor(face.img, cv2.COLOR_BGR2GRAY)
+            for k in range(face.img.shape[2]):
+                face.img[:, :, k] = gray
+            # brighten the face
             face = self.brighten_face(face)
+            face = self._remove_jew_new(face)
             face = self.remove_jew(face)
             face = self._resize_img_by_width(face, template.iw)
             blended_img = self.blend_imgs(face, template)
@@ -55,7 +86,7 @@ class ExpressionMaker:
             output_filename = output_dir + '%03d.jpg' % (i + start_num,)
             cv2.imwrite(output_filename, expression)
 
-        return
+        return expressions
 
     def face_recognition(self, img_name):
         try:
@@ -72,18 +103,20 @@ class ExpressionMaker:
             one_face = np.array(roi_color)
             img = cv2.rectangle(img, (x, y), (x + w, y + h), (255, 0, 0), 2)
             eyes = self.eye_cascade.detectMultiScale(roi_gray)
-            top, left, right = 100000, 100000, 0
+            top, left, right, bottom = 100000, 100000, 0, 0
             for (ex, ey, ew, eh) in eyes:
                 cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
                 if ey < top: top = ey
+                if ey > bottom: bottom = ey
                 if ex < left: left = ex
                 if ex + ew > right: right = ex + ew
             if len(eyes):
                 one_face = one_face[top:, left:right]
-            cut_faces.append(one_face)
+            cut_faces.append(Face(one_face, top, bottom))
         return cut_faces
 
     def brighten_face(self, face):
+        face, top, bottom = face.img, face.eye_top, face.eye_bottom
         median = np.median(face)
         thredshold = 220
         if median < thredshold:
@@ -104,10 +137,45 @@ class ExpressionMaker:
         face = face.astype(np.uint8)
         plt.subplot(122)
         plt.imshow(face)
-        return face
+        return Face(face, top, bottom)
+
+    def _remove_jew_new(self, face):
+        # get edge image by convolution
+        edge = conv([[-1, 0], [0, 1]], face.img)
+
+        # get edge std value map
+        def get_std(img, size):
+            ans = np.zeros(img.shape[:2])
+            y_bound, x_bound, _ = img.shape
+            for y in range(y_bound):
+                for x in range(x_bound):
+                    if y < size:
+                        ans[y, x] = 60
+                    if x < size or y < size or x + size > x_bound or y + size > y_bound:
+                        continue
+                    cut = img[y - size / 2:y + size - size / 2, x - size / 2:x + size - size / 2]
+                    ans[y, x] = np.std(cut)
+            return ans
+        edge_std = get_std(edge, 5)
+
+        def _linear_filter(x, alpha):
+            alpha **= 0.2
+            l, r = 5, 25
+            if x < l: return 1.0 * alpha
+            if x > r: return 0.0
+            return (- (x - l) * 1. / (r - l) + 1) * alpha
+        for y in range(face.img.shape[0]):
+            for x in range(face.img.shape[1]):
+                if y <= face.eye_bottom:
+                    remove_alpha = float(y) / float(face.eye_bottom)
+                value = face.img[y, x, 0]
+                remove_rate = _linear_filter(edge_std[y, x], remove_alpha)
+                face.img[y, x] = value + remove_rate * (255. - float(value))
+        return face.img
 
     def remove_jew(self, face):
-        median = np.median(face)
+        median = np.median(face[face < 254])
+
         def find_jew_coor(img):
             x_middle = img.shape[1] // 2
             thredshold = median
@@ -115,18 +183,14 @@ class ExpressionMaker:
                 if img[y, x_middle].mean() >= thredshold:
                     return (x_middle, y)
             return (x_middle, img.shape[1] - 1)
-
         start_point = find_jew_coor(face)
         begin_x, begin_y = start_point
-        queue = [start_point, (face.shape[1] - 1, face.shape[0] - 1), (0, face.shape[0] - 1)]
+        queue = [(i, face.shape[0] - 8) for i in range(face.shape[1])]
         visited = set(queue)
         fill_value = 255
         while len(queue):
             x, y = queue.pop()
             flag = 0
-            if begin_y - y > abs(x - begin_x):
-                continue
-
             if face[y, x].mean() < median:
                 flag = 1
                 face[y, x] = fill_value
@@ -135,7 +199,8 @@ class ExpressionMaker:
                     if add_y == -1:
                         continue
                     if x - begin_x > 0:
-                        if add_x < 0: continue
+                        if add_x < 0:
+                            continue
                     elif add_x > 0:
                         continue
                 new_x, new_y = x + add_x, y + add_y
@@ -144,41 +209,12 @@ class ExpressionMaker:
                         or new_y >= face.shape[0] \
                         or new_y < 0:
                     continue
-
-                if (new_x, new_y) in visited: continue
+                if (new_x, new_y) in visited:
+                    continue
                 visited.add((new_x, new_y))
                 queue.insert(0, (new_x, new_y))
-
-        def get_eraser(size=10):
-            erase = np.zeros((size, size), dtype=np.float16)
-            center = size // 2
-            for x in range(size):
-                for y in range(size):
-                    distance = np.sqrt((x - center) ** 2 + (y - center) ** 2)
-                    erase[x, y] = 1 - distance / size * 2
-            return erase
-
-        def erase_img(img, eraser, x, y, alpha=1.0):
-            if isinstance(eraser, int):
-                eraser = get_eraser(eraser * 2)
-            bound_y, bound_x, _ = img.shape
-            erase_size = eraser.shape[0] // 2
-            cut_erase = eraser[max(0, erase_size - y):min(erase_size * 2, erase_size + bound_y - y),
-                        max(0, erase_size - x): min(erase_size * 2, erase_size + bound_x - x)]
-            cut_erase *= alpha
-            ly, ry = max(0, y - erase_size), min(y + erase_size, bound_y)
-            lx, rx = max(0, x - erase_size), min(x + erase_size, bound_x)
-            area = img[ly:ry, lx:rx]
-            t = area[:, :, 0].astype(np.float16)
-            t = 255 - ((255 - t) - (255 - t) * cut_erase)
-            for i in range(3):
-                area[:, :, i] = t.astype(np.uint8)
-
-        erase_size = 2
-        eraser = get_eraser(erase_size * 2)
         for x, y in visited:
-            erase_img(face, eraser, x, y)
-
+            face[y-2:y+2, x-2:x+2] = fill_value
         return face
 
     def _resize_img_by_width(self, face_img, target_width=120):
@@ -189,7 +225,6 @@ class ExpressionMaker:
         template = Template(cv2.imread('../template/' + filename))
         template.ix, template.iy, template.iw, template.ih = \
             [int(x) for x in filename.split('.')[0].split('_')]
-
         return template
 
     def blend_imgs(self, face_img, template):

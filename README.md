@@ -14,7 +14,7 @@ It will recognize the faces of demo.jpg and make a rage expression for each of t
 
 Source image
 
-![](demo.jpg)
+![](input/demo.jpg)
 
 Generated image
 

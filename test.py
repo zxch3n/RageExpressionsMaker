@@ -9,8 +9,15 @@
 __author__ = "Rem"
 
 import maker
+import os
 
 if __name__ == '__main__':
     m = maker.ExpressionMaker()
-    m.make_expression('demo.jpg')
+    root = './input/'
+    for file in os.listdir(root):
+        if file != 'demo.jpg': continue
+        try:
+            m.make_expression(root + file)
+        except BaseException:
+            pass
 
